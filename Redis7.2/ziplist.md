@@ -38,3 +38,126 @@ ziplist的实现主要在ziplist.h和ziplist.c文件中。在ziplist.c的源码�
   - |1111xxxx| 12个立即数，也就是说后面四位直接表示数字，从0001到1101（0000，1110，1111不可用），一共12个数，从0开始。
   - 注意：和特殊字段一样，整数采用小端地址存储。
 - entry-data即存储的数据，如果存储的数据为小整数类型，则这部分会省略，直接并入encoding字段。
+
+## 压缩列表的创建
+
+压缩列表的创建的逻辑在unsigned char *ziplistNew(void) 函数中实现，声明和定义分别位于ziplist.h，ziplist.c。具体代码如下，首先计算压缩列表头尾的字节长度，然后在内存中进行分配，随后对zlbytes、zltail、zllen三个字段进行赋值。其中intrev32ifbe函数调用了endiancov.c文件中的intrev32函数，该函数是为了将32位整数的小端存储转换为大端存储。
+
+```c
+unsigned char *ziplistNew(void) {
+    unsigned int bytes = ZIPLIST_HEADER_SIZE+ZIPLIST_END_SIZE;
+    unsigned char *zl = zmalloc(bytes);
+    ZIPLIST_BYTES(zl) = intrev32ifbe(bytes);
+    ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(ZIPLIST_HEADER_SIZE);
+    ZIPLIST_LENGTH(zl) = 0;
+    zl[bytes-1] = ZIP_END;
+    return zl;
+}
+```
+
+## 压缩列表的插入
+
+压缩列表的插入操作由unsigned char *ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char *s, unsigned int slen)函数实现，同样在ziplist.h中定义，在ziplist.c中实现。注意，该函数的调用需要知道在压缩列表中的插入位置（p）。该函数的实现很简单，直接调用另一个函数unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char *s, unsigned int slen)，具体的逻辑在这个函数中实现，同样，由于有点复杂，这里分段分析。
+
+**首先**是计算p指向的元素前一个元素的长度。可以分为三种情况：
+
+- 如果当前列表为空，则直接插入，因为前一个元素长度为0.
+- 如果插入位置在列表尾部，则需要将前一个元素的三个字段的空间加起来。
+- 如果插入位置在列表中间，则只需要获取当前p指向元素所记录的prevlen字段即可。
+
+代码如下，首先判断p指向的位置（需要插入的位置）是否为列表尾部（ZIP_END为255），如果不为尾部，则直接解码p指向的元素。否则通过ZIPLIST_ENTRY_TAIL宏定义获取最后一个元素，计算三个字段的和并返回。
+
+```c
+if (p[0] != ZIP_END) {
+    ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
+} else {
+    unsigned char *ptail = ZIPLIST_ENTRY_TAIL(zl);
+    if (ptail[0] != ZIP_END) {
+        prevlen = zipRawEntryLengthSafe(zl, curlen, ptail);
+    }
+}
+```
+
+**第二步**，计算待插入元素所需要的字节空间，代码如下。首先尝试将传入的元素（无论字符串还是整数传入的都是字符串）进行编码，对应zipTryEncoding函数，该函数的实现调用了sds中实现的string2ll函数，尝试将字符串转换为整数。string2ll函数要求传入的字符串为严格的“整数格式”否则转换失败。
+
+尝试将字符串转换为整数后，如果成功，则计算整数需要的存储字节数，否则数据作为字符串存储，数据所占空间为字符串长度。注意到目前为止reqlen只记录了数据在entry所需要的空间，所以后面会将prevlen元素需要的空间和encoding元素需要的空间加上得到插入元素entry总的长度。具体得到的结果可以参考上面对entry结构体的介绍，因为得到prevlen和encoding元素所需长度的两个函数的判断逻辑基本符合上面对entry的分析，当然，感兴趣还是可以去看这两个函数的源码详细了解。
+
+```c
+if (zipTryEncoding(s,slen,&value,&encoding)) {
+
+    reqlen = zipIntSize(encoding);
+} else {
+    reqlen = slen;
+}
+reqlen += zipStorePrevEntryLength(NULL,prevlen);
+reqlen += zipStoreEntryEncoding(NULL,encoding,slen);
+```
+
+**第三步**，计算下一个元素（还未在p处插入新元素时p指向的元素）所需空间的变化并分配空间，代码如下。在列表中见插入元素时，后面的第一个entry的prevlen字段可能会变化。因为插入过后它的前一个元素的长度已经改变了，并且，该字段的空间变化只有三种可能，减小4字节（此时插入的entry长度小于等于254字节）、不变、增大4字节（此时插入的entry长度大于254字节）。
+
+当前面计算的reqlen < 4 && nextdiff == -4 时，会产生一个问题，就是ziplist的整体长度变小了，并且接着后面会调用ziplistResize函数（里面会调用realloc函数），则可能会被realloc函数回收多余的空间导致数据丢失，因为resize操作的时候还没有移动各个entry内容，只是缩短了原来ziplist的空间。所以，如果遇到这种情况则使用forcelarge标志，这样在后面resize操作时可以进行处理。
+
+最后四行代码就是记录p相对于表头的offset，然后分配所需空间。
+
+```c
+int forcelarge = 0;
+nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p,reqlen) : 0;
+if (nextdiff == -4 && reqlen < 4) {
+    nextdiff = 0;
+    forcelarge = 1;
+}
+
+offset = p-zl;
+newlen = curlen+reqlen+nextdiff;
+zl = ziplistResize(zl,newlen);
+p = zl+offset;
+```
+
+**第四步**，移动原先的内容，代码如下。移动后，修改下一个entry的prevlen字段，如果forcelarge为1，则该字段必为5个字节。否则会根据情况选择1字节或5字节。最后会根据情况修改ziplist中最后一个元素的偏移字段。
+
+```c
+if (p[0] != ZIP_END) {
+    memmove(p+reqlen,p-nextdiff,curlen-offset-1+nextdiff);
+
+    if (forcelarge)
+        zipStorePrevEntryLengthLarge(p+reqlen,reqlen);
+    else
+        zipStorePrevEntryLength(p+reqlen,reqlen);
+
+    ZIPLIST_TAIL_OFFSET(zl) =
+        intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+reqlen);
+        
+    assert(zipEntrySafe(zl, newlen, p+reqlen, &tail, 1));
+    if (p[reqlen+tail.headersize+tail.len] != ZIP_END) {
+        ZIPLIST_TAIL_OFFSET(zl) =
+            intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+nextdiff);
+    }
+} else {
+    ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(p-zl);
+}
+```
+
+**最后一步**，进行级联更新、正式插入数据并将列表长度加一，代码如下。对于级联更新这里可以举一个例子方便理解。即在当前插入的位置及其后面所有的entry的长度都为253，并且当前插入的元素导致原本长度为253字节的entry增加4个字节（prevlen），则后面所有的entry的prevlen字节空间都需要增加4字节。
+
+```c
+if (nextdiff != 0) {
+    offset = p-zl;
+    zl = __ziplistCascadeUpdate(zl,p+reqlen);
+    p = zl+offset;
+}
+
+p += zipStorePrevEntryLength(p,prevlen);
+p += zipStoreEntryEncoding(p,encoding,slen);
+if (ZIP_IS_STR(encoding)) {
+    memcpy(p,s,slen);
+} else {
+    zipSaveInteger(p,value,encoding);
+}
+ZIPLIST_INCR_LENGTH(zl,1);
+return zl;
+```
+
+## 压缩列表的删除
+
+列表的删除的函数为unsigned char *ziplistDelete(unsigned char *zl, unsigned char **p)，被声明在ziplist.h中，实现在ziplist.c中。该函数也是直接调用了一个内部函数unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num)，后者函数可以从p指向的位置开始删除num个元素。
+
