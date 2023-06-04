@@ -161,3 +161,89 @@ return zl;
 
 列表的删除的函数为unsigned char *ziplistDelete(unsigned char *zl, unsigned char **p)，被声明在ziplist.h中，实现在ziplist.c中。该函数也是直接调用了一个内部函数unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num)，后者函数可以从p指向的位置开始删除num个元素。
 
+这里还是分段分析__ziplistDelete函数的代码。
+
+**首先**是计算需要删除的字节数，代码如下。使用first记录p指向的第一个entry（也是第一个需要删除的entry）。然后向后遍历num个entry，为需要删除的entry个数。最后使用totlen计算总的需要删除的字节数。后面的步骤只有在totlen > 0的情况下才会进行，否则没有需要删除entry，直接返回。
+
+```c
+unsigned int i, totlen, deleted = 0;
+size_t offset;
+int nextdiff = 0;
+zlentry first, tail;
+size_t zlbytes = intrev32ifbe(ZIPLIST_BYTES(zl));
+
+zipEntry(p, &first); 
+for (i = 0; p[0] != ZIP_END && i < num; i++) {
+    p += zipRawEntryLengthSafe(zl, zlbytes, p);
+    deleted++;
+}
+
+assert(p >= first.p);
+totlen = p-first.p; 
+```
+
+ **第二步**，经过第一步，此时p已经指向了需要被删除的entry后面的第一个entry。如果p指向的是列表尾部，则不需要修改什么；否则，p指向的是一个entry元素，需要修改该entry元素的prevlen元素，因为删除过后该entry前面的entry改变了。
+
+如果p指向的是一个entry元素，首先调用zipPrevLenByteDiff函数计算prevlen字段的变化长度，同上面插入操作，nextdiff可能为-4，0，4。zipStorePrevEntryLength函数将修改p指向的entry的prevlen字段。另外，这里区分一下zipEntrySafe和zipEntry两个函数。两者都是将当前指向的entry元素解析为一个zlentry结构体，方便后面操作。区别在于前者是安全的，后者是不安全的。前者在解码的过程中会检查是否访问了ziplist所属内存空间外的内存，而后者假设传入的指向entry的指针p已经是检测过并且安全的，所以在解码的过程中不会额外检测。前者若检测到非法越界访问内存空间，则返回0，否则返回1。
+
+set_tail字段用来修改对最后一个entry的偏移。最后就是移动被删除entry后面entry的内容到前面。
+
+```c
+if (p[0] != ZIP_END) {
+    /*如果p指向的不是列表尾部，则计算当前p指向的元素的prevlen字段在删除前后的变化
+     * */
+    nextdiff = zipPrevLenByteDiff(p,first.prevrawlen);
+
+    p -= nextdiff;
+    assert(p >= first.p && p<zl+zlbytes-1);
+    zipStorePrevEntryLength(p,first.prevrawlen);
+
+    set_tail = intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))-totlen;
+
+    assert(zipEntrySafe(zl, zlbytes, p, &tail, 1));
+    if (p[tail.headersize+tail.len] != ZIP_END) {
+        set_tail = set_tail + nextdiff;
+    }
+
+    size_t bytes_to_move = zlbytes-(p-zl)-1;
+    memmove(first.p,p,bytes_to_move);
+} else {
+    set_tail = (first.p-zl)-first.prevrawlen;
+}
+```
+
+**第三步**，重新分配压缩列表的空间。
+
+```C
+offset = first.p-zl;
+zlbytes -= totlen - nextdiff;
+zl = ziplistResize(zl, zlbytes);
+p = zl+offset;
+```
+
+第四步，设置列表的长度，设置表尾元素偏移，并进行级联更新。
+
+```c
+ZIPLIST_INCR_LENGTH(zl,-deleted);
+
+assert(set_tail <= zlbytes - ZIPLIST_END_SIZE);
+ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(set_tail);
+
+if (nextdiff != 0)
+    zl = __ziplistCascadeUpdate(zl,p);
+```
+
+
+
+最后，这里简单提一下压缩列表的级联更新。可以大致分为三个步骤。
+
+- 遍历一次更新位置的列表后面部分，直到一个entry不需要更新prevlen字段。对每个字段计算需要的额外空间。
+- 更新tail offset。
+- 从后往前，更新每个需要级联更新的entry的prevlen字段。
+
+
+
+
+
+
+
